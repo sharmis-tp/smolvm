@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use smolvm_oci_layer::extract_oci_layer;
 use smolvm_oci_layer::{decompress_layer_reader, extract_oci_layer_with_size};
+use smolvm_protocol::disk_volume::DiskVolume;
 use smolvm_protocol::guest_env;
 use smolvm_protocol::{
     image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
@@ -671,7 +672,7 @@ fn is_disk_volume_tag(tag: &str) -> bool {
 }
 
 /// The disk volumes the host requested, already validated.
-fn disk_volume_targets() -> Vec<String> {
+fn disk_volume_targets() -> Vec<DiskVolume> {
     std::env::var(guest_env::DISK_VOLUMES)
         .map(|value| smolvm_protocol::disk_volume::decode(&value))
         .unwrap_or_default()
@@ -691,7 +692,8 @@ pub fn disk_volumes_requested() -> bool {
 #[cfg(target_os = "linux")]
 fn mount_disk_volumes() -> Vec<(String, String, bool)> {
     let mut mounts = Vec::new();
-    for target in disk_volume_targets() {
+    for volume in disk_volume_targets() {
+        let target = volume.target.clone();
         let name = smolvm_protocol::disk_volume::storage_dir_name(&target);
         let tag = format!("{DISK_VOLUME_TAG_PREFIX}{name}");
         let data = Path::new(DISK_VOLUME_ROOT).join(&name);
@@ -707,6 +709,7 @@ fn mount_disk_volumes() -> Vec<(String, String, bool)> {
                     Ok(())
                 }
             })
+            .and_then(|()| apply_requested_owner(&data, &volume))
             .and_then(|()| std::fs::create_dir_all(&staging))
             .and_then(|()| {
                 if is_mountpoint(&staging) {
@@ -734,6 +737,33 @@ fn mount_disk_volumes() -> Vec<(String, String, bool)> {
     Vec::new()
 }
 
+/// Give a disk volume's directory the owner and mode its spec asks for
+/// (`-v /data:uid=1000,gid=1000,mode=750`). This runs on every start, so they
+/// hold across restarts even if they were changed inside the machine. The owner
+/// goes first because a chown can clear setuid and setgid bits the mode sets.
+#[cfg(target_os = "linux")]
+fn apply_requested_owner(dir: &Path, volume: &DiskVolume) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if volume.uid.is_none() && volume.gid.is_none() && volume.mode.is_none() {
+        return Ok(());
+    }
+    std::os::unix::fs::chown(dir, volume.uid, volume.gid)?;
+    if let Some(mode) = volume.mode {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))?;
+    }
+    info!(volume = %volume, "disk volume given its requested owner and mode");
+    Ok(())
+}
+
+/// The requested disk volume whose storage directory is `name`.
+#[cfg(target_os = "linux")]
+fn requested_disk_volume(name: &str) -> Option<DiskVolume> {
+    disk_volume_targets()
+        .into_iter()
+        .find(|volume| smolvm_protocol::disk_volume::storage_dir_name(&volume.target) == name)
+}
+
 /// Marks a disk volume that has not yet taken its owner from an image. It sits
 /// beside the volume directories (whose names never start with `.`), outside
 /// what the workload sees.
@@ -746,7 +776,8 @@ fn disk_volume_owner_marker(name: &str) -> PathBuf {
 /// postgres image belongs to postgres, not root. When the image has no such
 /// directory, the volume takes the owner (not the mode) of the nearest
 /// directory above it, so `/home/node/.cache` belongs to node. This runs once
-/// per volume, so an owner later set inside the machine is kept.
+/// per volume, so an owner later set inside the machine is kept. A uid, gid or
+/// mode given in the volume's spec is applied again after it, so it wins.
 #[cfg(target_os = "linux")]
 fn adopt_image_ownership(rootfs: &Path, tag: &str, container_path: &str, volume: &Path) {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -779,6 +810,11 @@ fn adopt_image_ownership(rootfs: &Path, tag: &str, container_path: &str, volume:
             }),
         None => Ok(()),
     };
+    // What the volume's spec asks for wins over the image's.
+    let result = result.and_then(|()| match requested_disk_volume(name) {
+        Some(requested) => apply_requested_owner(volume, &requested),
+        None => Ok(()),
+    });
     // Drop the marker either way: the first image decides, and a later one
     // must not override an owner set inside the machine in between.
     if let Err(error) = result.and_then(|()| std::fs::remove_file(&marker)) {
@@ -6680,6 +6716,32 @@ mod tests {
         reset_workload_tmp(overlay.path());
         ensure_workload_tmp(overlay.path()).unwrap();
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn requested_disk_volume_owner_and_mode_are_applied() {
+        use smolvm_protocol::disk_volume::DiskVolume;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("volume");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mode = |dir: &std::path::Path| std::fs::metadata(dir).unwrap().mode() & 0o7777;
+
+        // No options: the directory is left as it is.
+        super::apply_requested_owner(&dir, &DiskVolume::new("/data".to_string())).unwrap();
+        assert_eq!(mode(&dir), 0o755);
+
+        // The test's own uid and gid, so it passes without root. The setgid
+        // bit survives because the mode is applied after the owner.
+        let owner = std::fs::metadata(&dir).unwrap();
+        let spec = format!("/data:uid={},gid={},mode=2770", owner.uid(), owner.gid());
+        super::apply_requested_owner(&dir, &DiskVolume::parse(&spec).unwrap()).unwrap();
+        let meta = std::fs::metadata(&dir).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (owner.uid(), owner.gid()));
+        assert_eq!(mode(&dir), 0o2770);
     }
 
     #[cfg(target_os = "linux")]
