@@ -42,6 +42,7 @@ pub fn split_disk_volume_specs(specs: &[String]) -> Result<(Vec<String>, Vec<Dis
     let mut disk: Vec<DiskVolume> = Vec::new();
     for spec in specs {
         if !is_disk_volume_spec(spec) {
+            reject_owner_options(spec)?;
             rest.push(spec.clone());
             continue;
         }
@@ -71,6 +72,31 @@ fn is_disk_volume_spec(spec: &str) -> bool {
         None => true,
         Some((_, options)) => !options.starts_with('/') && options.contains('='),
     }
+}
+
+/// Refuse `uid=`, `gid=` or `mode=` on a spec that is not a disk volume. The
+/// host and remote parsers would otherwise read `/src:/data:uid=1000` as a
+/// mount of the source `/src:/data`, and fail with a misleading
+/// "mount source not found".
+fn reject_owner_options(spec: &str) -> Result<()> {
+    let Some((_, last)) = spec.rsplit_once(':') else {
+        return Ok(());
+    };
+    let is_owner_option = |option: &str| {
+        option
+            .split_once('=')
+            .is_some_and(|(key, _)| matches!(key, "uid" | "gid" | "mode"))
+    };
+    if last.split(',').any(is_owner_option) {
+        return Err(Error::mount(
+            "validate mounts",
+            format!(
+                "uid=, gid= and mode= only apply to disk volumes (a guest path alone, \
+                 like -v /data:uid=1000), not to '{spec}'"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Apply a `machine update`'s disk volume changes: drop the removed targets,
@@ -241,6 +267,7 @@ impl HostMount {
     /// If no mode is provided, the mount defaults to writable.
     /// The source path is validated, required to be a directory, and canonicalized.
     fn _parse(spec: &str, allow_system_mounts: bool) -> Result<Self> {
+        reject_owner_options(spec)?;
         // Parse from the right so a Windows host path keeps its drive-letter
         // colon (e.g. `C:\data:/data:ro`). The guest path is a Unix path with no
         // colon, and the optional trailing mode is `ro`/`rw`; everything before
@@ -529,6 +556,38 @@ mod tests {
         assert!(err.to_string().contains("user=1000"), "{err}");
         let dup = ["/data".to_string(), "/data:uid=1".to_string()];
         assert!(split_disk_volume_specs(&dup).is_err());
+    }
+
+    /// The owner options belong to disk volumes; on a host directory or S3
+    /// mount they are refused as such, not read as part of the source path.
+    #[test]
+    fn owner_options_on_a_host_mount_are_refused_as_disk_volume_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().display().to_string();
+        for spec in [
+            format!("{host}:/data:uid=1000,gid=1000"),
+            format!("{host}:/data:mode=750"),
+            format!("{host}:/data:ro,uid=1000"),
+            "./src:/data:gid=50".to_string(),
+            "s3://bucket/prefix:/data:uid=1000".to_string(),
+        ] {
+            let err = split_disk_volume_specs(std::slice::from_ref(&spec)).unwrap_err();
+            assert!(
+                err.to_string().contains("only apply to disk volumes"),
+                "{spec}: {err}"
+            );
+        }
+        // `machine mount add` parses with HostMount directly.
+        let err = HostMount::parse(&[format!("{host}:/data:uid=1000")]).unwrap_err();
+        assert!(
+            err.to_string().contains("only apply to disk volumes"),
+            "{err}"
+        );
+
+        // Host mounts without the options still parse as before.
+        let (rest, disk) = split_disk_volume_specs(&[format!("{host}:/data:ro")]).unwrap();
+        assert!(disk.is_empty());
+        assert!(HostMount::parse(&rest).unwrap()[0].read_only);
     }
 
     #[test]

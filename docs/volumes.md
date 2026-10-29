@@ -19,10 +19,16 @@ smolvm machine create --name app --image alpine -v /data:uid=1000,gid=1000,mode=
 ```
 
 Any of `uid`, `gid` and `mode` (octal) can be given, in any order. The agent
-applies them to the volume's directory, not its contents, on every start, so
-they also hold after a `chown` or `chmod` inside the machine. The ones left out
-come from the image as above. `machine update --name app -v /data:uid=1001`
-replaces them on a stopped machine, and `-v /data` alone stops setting them.
+applies them to the volume's directory, not its contents, when the volume is
+created and again whenever they change, so a `chown` or `chmod` inside the
+machine survives a restart, as it does for a volume without them. The ones
+left out come from the image as above. `machine update --name app -v
+/data:uid=1001` replaces them on a stopped machine and applies them on its next
+start, and `-v /data` alone stops setting them.
+
+These options only apply to disk volumes. On a host directory
+(`-v ./src:/data:uid=1000`) they are refused: its owner is whatever the host's
+file server presents.
 
 ## S3 buckets
 

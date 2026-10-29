@@ -9,7 +9,9 @@
 //!
 //! `-v /data:uid=1000,gid=1000,mode=750` also gives the volume's directory
 //! that owner and mode, the way `machine cp --uid --gid --mode` does for a
-//! file. The agent applies them on every start, so they hold across restarts.
+//! file. The agent applies them when the volume is created and again when they
+//! change, so a `chown` inside the machine survives a restart, as it does for a
+//! volume without them.
 //!
 //! The host passes each volume's spec ([`DiskVolume`]), joined into
 //! [`crate::guest_env::DISK_VOLUMES`]; the guest agent derives each volume's
@@ -24,8 +26,9 @@ use std::fmt;
 const SEPARATOR: char = ':';
 
 /// A disk volume: its normalized guest target, and the owner and mode its
-/// directory is given on every start. An unset field leaves the directory as it
-/// is, so a new volume keeps the ownership it takes from the image.
+/// directory is given when it is created or they change. An unset field leaves
+/// the directory as it is, so a new volume keeps the ownership it takes from
+/// the image.
 ///
 /// It is stored as its spec string (`/data` or `/data:uid=1000,mode=0750`), so
 /// records written before the options existed, a bare target, still read.
@@ -51,6 +54,11 @@ impl DiskVolume {
             gid: None,
             mode: None,
         }
+    }
+
+    /// Whether the spec gives an owner or mode for the directory.
+    pub fn has_options(&self) -> bool {
+        self.uid.is_some() || self.gid.is_some() || self.mode.is_some()
     }
 
     /// Parse `TARGET[:uid=UID,gid=GID,mode=OCTAL]`, any subset of the options

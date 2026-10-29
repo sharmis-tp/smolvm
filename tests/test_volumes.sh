@@ -412,13 +412,26 @@ test_disk_volume_takes_image_ownership() {
     fi
 }
 
-# A disk volume given uid=, gid= or mode= (#1858) gets them on every start: over
-# the image's ownership (/var/cache/nginx is 101:0 775 in this image, and keeps
-# the owner it was not given) and over a chown inside the machine. Re-adding the
-# path with machine update replaces them, leaving out what it does not name.
+# A disk volume given uid=, gid= or mode= (#1858) gets them when it is created,
+# over the image's ownership (/var/cache/nginx is 101:0 775 in this image, and
+# keeps the owner it was not given). A chown inside the machine then survives a
+# restart, as it does without options (#1870). Changing them with machine update
+# applies only what the new spec names on the next start. Options on a host
+# directory are refused as disk-volume-only.
 test_disk_volume_requested_owner_and_mode() {
     local vm_name="test-vm-diskvol-requested"
     $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+
+    local host_dir host_err
+    host_dir=$(mktemp -d)
+    host_err=$($SMOLVM machine create --name "$vm_name" --image alpine \
+        -v "$host_dir:/data:uid=1000" 2>&1)
+    rm -rf "$host_dir"
+    if [[ "$host_err" != *"only apply to disk volumes"* ]]; then
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+        log_fail "options on a host directory: $host_err"
+        return 1
+    fi
 
     $SMOLVM machine create --name "$vm_name" --net \
         --image nginxinc/nginx-unprivileged:stable-alpine \
@@ -442,12 +455,13 @@ test_disk_volume_requested_owner_and_mode() {
     $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
 
     local expected=$'/var/cache/nginx 101:0 700\n/data 1000:1000 750'
-    local expected_updated=$'/var/cache/nginx 101:0 700\n/data 1001:1000 750'
+    local expected_restarted=$'/var/cache/nginx 101:0 700\n/data 0:0 755'
+    local expected_updated=$'/var/cache/nginx 101:0 700\n/data 1001:0 755'
     if [[ "$fresh" != "$expected" ]]; then
         log_fail "fresh ownership: $fresh"
         return 1
     fi
-    if [[ "$restarted" != "$expected" ]]; then
+    if [[ "$restarted" != "$expected_restarted" ]]; then
         log_fail "ownership after restart: $restarted"
         return 1
     fi
@@ -468,6 +482,6 @@ run_test "Create with --image: Smolfile volumes visible to exec" test_image_exec
 run_test "Create with --image: volume targets at/below /workspace resolve in guest" test_image_volume_targets_resolve_inside_guest || true
 run_test "Volume: staged sync and restart persistence" test_staged_volume_sync_and_restart || true
 run_test "Volume: new disk volume takes the image's ownership" test_disk_volume_takes_image_ownership || true
-run_test "Volume: disk volume keeps its requested owner and mode" test_disk_volume_requested_owner_and_mode || true
+run_test "Volume: disk volume takes its requested owner and mode once" test_disk_volume_requested_owner_and_mode || true
 
 print_summary "Volume Tests"

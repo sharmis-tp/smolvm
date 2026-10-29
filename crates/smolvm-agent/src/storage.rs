@@ -709,7 +709,9 @@ fn mount_disk_volumes() -> Vec<(String, String, bool)> {
                     Ok(())
                 }
             })
-            .and_then(|()| apply_requested_owner(&data, &volume))
+            .and_then(|()| {
+                apply_requested_owner_if_changed(&data, &disk_volume_applied_marker(&name), &volume)
+            })
             .and_then(|()| std::fs::create_dir_all(&staging))
             .and_then(|()| {
                 if is_mountpoint(&staging) {
@@ -738,14 +740,13 @@ fn mount_disk_volumes() -> Vec<(String, String, bool)> {
 }
 
 /// Give a disk volume's directory the owner and mode its spec asks for
-/// (`-v /data:uid=1000,gid=1000,mode=750`). This runs on every start, so they
-/// hold across restarts even if they were changed inside the machine. The owner
-/// goes first because a chown can clear setuid and setgid bits the mode sets.
+/// (`-v /data:uid=1000,gid=1000,mode=750`). The owner goes first because a
+/// chown can clear setuid and setgid bits the mode sets.
 #[cfg(target_os = "linux")]
 fn apply_requested_owner(dir: &Path, volume: &DiskVolume) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    if volume.uid.is_none() && volume.gid.is_none() && volume.mode.is_none() {
+    if !volume.has_options() {
         return Ok(());
     }
     std::os::unix::fs::chown(dir, volume.uid, volume.gid)?;
@@ -754,6 +755,38 @@ fn apply_requested_owner(dir: &Path, volume: &DiskVolume) -> std::io::Result<()>
     }
     info!(volume = %volume, "disk volume given its requested owner and mode");
     Ok(())
+}
+
+/// Apply a disk volume's requested owner and mode only when the volume is new
+/// or the spec changed since they were last applied (`marker` holds the spec
+/// that was). A `chown` or `chmod` inside the machine then survives a restart,
+/// as it does for a volume without options (#1870), while `machine update -v
+/// /data:uid=1001` still takes effect on the next start. A spec without
+/// options drops the marker, so giving the same options again reapplies them.
+#[cfg(target_os = "linux")]
+fn apply_requested_owner_if_changed(
+    dir: &Path,
+    marker: &Path,
+    volume: &DiskVolume,
+) -> std::io::Result<()> {
+    if !volume.has_options() {
+        return match std::fs::remove_file(marker) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    }
+    let spec = volume.to_string();
+    if std::fs::read_to_string(marker).is_ok_and(|applied| applied == spec) {
+        return Ok(());
+    }
+    apply_requested_owner(dir, volume)?;
+    std::fs::write(marker, spec)
+}
+
+/// Records the spec whose owner and mode a disk volume was last given. Like
+/// [`disk_volume_owner_marker`], it sits beside the volume directories.
+fn disk_volume_applied_marker(name: &str) -> PathBuf {
+    Path::new(DISK_VOLUME_ROOT).join(format!(".{name}.owner-applied"))
 }
 
 /// The requested disk volume whose storage directory is `name`.
@@ -777,7 +810,8 @@ fn disk_volume_owner_marker(name: &str) -> PathBuf {
 /// directory, the volume takes the owner (not the mode) of the nearest
 /// directory above it, so `/home/node/.cache` belongs to node. This runs once
 /// per volume, so an owner later set inside the machine is kept. A uid, gid or
-/// mode given in the volume's spec is applied again after it, so it wins.
+/// mode given in the volume's spec is applied again after it, so it wins over
+/// the image's.
 #[cfg(target_os = "linux")]
 fn adopt_image_ownership(rootfs: &Path, tag: &str, container_path: &str, volume: &Path) {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -6742,6 +6776,49 @@ mod tests {
         let meta = std::fs::metadata(&dir).unwrap();
         assert_eq!((meta.uid(), meta.gid()), (owner.uid(), owner.gid()));
         assert_eq!(mode(&dir), 0o2770);
+    }
+
+    /// The requested owner and mode are applied once per spec, so a change
+    /// made inside the machine survives a restart until the spec changes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn requested_disk_volume_owner_and_mode_are_applied_once_per_spec() {
+        use smolvm_protocol::disk_volume::DiskVolume;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("volume");
+        let marker = root.path().join(".volume.owner-applied");
+        std::fs::create_dir(&dir).unwrap();
+        let mode = || std::fs::metadata(&dir).unwrap().mode() & 0o7777;
+        let chmod_inside =
+            |bits| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(bits)).unwrap();
+        let start = |spec: &str| {
+            let volume = DiskVolume::parse(spec).unwrap();
+            super::apply_requested_owner_if_changed(&dir, &marker, &volume).unwrap();
+        };
+
+        // First start applies the spec.
+        start("/data:mode=750");
+        assert_eq!(mode(), 0o750);
+
+        // A chmod inside the machine survives the next start.
+        chmod_inside(0o755);
+        start("/data:mode=750");
+        assert_eq!(mode(), 0o755);
+
+        // A changed spec (`machine update -v /data:mode=700`) is applied.
+        start("/data:mode=700");
+        assert_eq!(mode(), 0o700);
+
+        // Clearing the options leaves the directory as it is; giving the same
+        // options again applies them again.
+        chmod_inside(0o755);
+        start("/data");
+        assert_eq!(mode(), 0o755);
+        assert!(!marker.exists());
+        start("/data:mode=700");
+        assert_eq!(mode(), 0o700);
     }
 
     #[cfg(target_os = "linux")]

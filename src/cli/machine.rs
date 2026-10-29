@@ -632,7 +632,8 @@ pub struct RunCmd {
     /// machine's own disk instead of its overlay root, which nested container
     /// runtimes need; it persists across stop and start.
     /// `-v /data:uid=1000,gid=1000,mode=750` also sets that directory's owner
-    /// and mode on every start, like `machine cp --uid --gid --mode`.
+    /// and mode when it is created or they change, like `machine cp --uid
+    /// --gid --mode`.
     #[arg(
         short = 'v',
         long = "volume",
@@ -4536,7 +4537,8 @@ pub struct CreateCmd {
     /// machine's own disk instead of its overlay root, which nested container
     /// runtimes need; it persists across stop and start.
     /// `-v /data:uid=1000,gid=1000,mode=750` also sets that directory's owner
-    /// and mode on every start, like `machine cp --uid --gid --mode`.
+    /// and mode when it is created or they change, like `machine cp --uid
+    /// --gid --mode`.
     #[arg(
         short = 'v',
         long = "volume",
@@ -6718,8 +6720,8 @@ pub struct UpdateCmd {
     /// which mirror it onto the host source, deleting host files the copy lacks.
     /// A guest path alone adds a
     /// directory on the machine's own disk; `/data:uid=1000,gid=1000,mode=750`
-    /// also sets its owner and mode on every start, and re-adding the path
-    /// replaces them.
+    /// also sets its owner and mode, and re-adding the path with changed ones
+    /// applies them on the next start.
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     pub volume: Vec<String>,
 
